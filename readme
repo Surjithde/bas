@@ -1,0 +1,485 @@
+# MCO Bastion – README
+
+This document explains how to deploy, operate, and audit the **MCO Bastion** host. It covers prerequisites, StackScript inputs, what the host installs and configures, how SSH and Ansible access are managed (including SSH-CA certificates), Kubernetes API tunneling, monitoring/metrics, security controls, day-2 operations, and troubleshooting.
+
+---
+
+## 1) Prerequisites
+
+- **Linode VM**: Any current Ubuntu LTS is fine. Public IPv4 required.
+- **Your admin public key**: `ssh-ed25519` (preferred) or `ssh-rsa`.
+- **Outbound internet** from the bastion for APT, package downloads, and optional metric/log shipping.
+- **Customer VMs**: Reachable on public IP for SSH (port 22). Their local firewalls should be able to allowlist the bastion’s public IP.
+- **Engineer workstations**: OpenSSH client; optionally Lens/Kubectl for cluster access.
+
+---
+
+## 2) What the StackScript provisions
+
+### 2.1 System users, groups, sudo
+- Creates or ensures groups: `mco-readonly`, `mco-support`, `mco-admin`, `bastion-admins`.
+- Creates **admin user** (default `mcoadmin`) with:
+  - `~/.ssh/authorized_keys` from your UDF input.
+  - Group membership: `sudo`, `mco-admin`, `bastion-admins`.
+  - **NOPASSWD sudo** via `/etc/sudoers.d/10-admin-nopasswd`.
+- Optional **ansible** user with NOPASSWD sudo and optional pubkey.
+
+### 2.2 SSH bastion hardening & tunneling policy
+- Generates host keys; enables `sshd`.
+- Baseline drop-in `/etc/ssh/sshd_config.d/60-mco-hardening.conf`:
+  - `AllowTcpForwarding yes`
+  - `PermitOpen 127.0.0.1:3128` (HTTPS proxy on loopback)
+  - `PermitOpen *:22` (allow TCP forwards to VM SSH)
+  - `AllowGroups mco-readonly mco-support mco-admin bastion-admins`
+- **Final override** appended at the end of `/etc/ssh/sshd_config` to guarantee last-wins:
+  - `/etc/ssh/sshd_config.d/zz-mco-final.conf` with:
+    - `PermitRootLogin no`
+    - `PasswordAuthentication no`
+    - `KbdInteractiveAuthentication no` (unless MFA explicitly enabled)
+    - `ChallengeResponseAuthentication no`
+    - `PubkeyAuthentication yes`
+    - `AuthenticationMethods publickey`
+- Optional **TOTP MFA** (UDF `enable_mfa=yes`) switches `AuthenticationMethods` to `publickey,keyboard-interactive` and enables PAM Google Authenticator.
+
+### 2.3 `/opt/mco` layout (Ansible + helpers)
+```
+/opt/mco
+  ├─ ansible/
+  │   ├─ inventory.ini                # edit: list of customer VMs
+  │   ├─ group_vars/all.yml           # keys & user lists for VMs
+  │   ├─ playbooks_minimal.yml        # creates groups/users on VMs
+  │   ├─ ufw_ssh_from_bastion.yml     # firewall restricts SSH to bastion IP
+  │   ├─ ansible.cfg                  # safe SSH defaults
+  │   └─ requirements.yml             # community.general
+  ├─ keys/
+  │   ├─ mco-readonly/                # drop RO public keys here
+  │   └─ mco-support/                 # support users: <username>.pub
+  ├─ bin/
+  │   ├─ mco-ro-keys-sync             # sync RO keys into vars
+  │   ├─ mco-add-ro-key               # append one RO key into vars
+  │   ├─ mco-add-support-user         # declare a support user from .pub
+  │   ├─ add_known_host.sh            # add VM host keys to /etc/ssh/ssh_known_hosts
+  │   ├─ mco-kube-make-tunnel.sh      # helper: API server SSH tunnel info
+  │   ├─ mco-verify.sh                # optional verifier (if you installed it)
+  │   └─ mco-sshca-bootstrap.sh       # optional one-shot SSH-CA bootstrap
+  ├─ BASTION_PUBLIC_IP                # auto-detected; used by playbooks
+  ├─ README.md                        # on-box overview
+  └─ examples/kubeconfig.tpl          # local tunnel kubeconfig template
+```
+
+### 2.4 Local proxy for HTTPS
+- **Squid** on `127.0.0.1:3128`, loopback only. No caching; headers minimized for privacy.
+
+### 2.5 Monitoring/metrics
+- **node_exporter** on `127.0.0.1:9100`, textfile collector enabled at `/var/lib/node_exporter/textfile_collector`.
+- Optional **blackbox_exporter** on `127.0.0.1:9115`.
+- **Prometheus (default)** with local scrape (node/blackbox) and optional **remote_write** to your central system (bearer, basic, or mTLS via files under `/etc/mco/secrets`).  
+  *Or* **Grafana Alloy** if you choose that option and supply a download URL.
+- Optional **local VictoriaMetrics** single-node on `127.0.0.1:8428` as a receiver (if enabled).
+- Optional **Promtail → Loki** with optional auth/mTLS and positions persisted.
+
+### 2.6 Security hardening
+- **UFW**: defaults to deny incoming; allows 22/tcp only from the CIDR list you provide.
+- **Fail2ban**: aggressive SSH jail.
+- **Unattended-upgrades**: autoreboot at 03:30 if needed.
+- **auditd** enabled.
+- Minimal **sysctl** hardening (`/etc/sysctl.d/99-mco.conf`).
+- **AIDE** initialized once; **Lynis** weekly timer.
+- Optional **egress enforcement** via UFW (allow only DNS/NTP/HTTP/HTTPS).
+
+### 2.7 Kube API tunneling
+- Helper to document a tunnel from an engineer workstation:
+  - `ssh -N -L <local_port>:<api_host>:443 <bastion_user>@<bastion_public_ip>`
+- Kubeconfig template points to `https://127.0.0.1:<local_port>`.
+
+---
+
+## 3) StackScript inputs (UDFs)
+
+**Core**
+- `admin_user` (default: `mcoadmin`)
+- `admin_pubkey` (**required**) – your SSH public key
+- `allow_ssh_cidrs` (CSV, default `0.0.0.0/0`) – tighten to your office/VPN blocks
+- `timezone` (default `UTC`)
+- `enable_mfa` (`yes`/`no`, default `no`)
+- `create_ansible_user` (`yes`/`no`, default `yes`)
+- `ansible_user_pubkey` (optional)
+
+**Observability**
+- `observability_option` (`prometheus`|`alloy`, default `prometheus`)
+- `alloy_download_url` (if `alloy` selected)
+
+**Remote write (optional)**
+- `central_metrics_remote_write_url` (blank = local only)
+- `central_metrics_auth_type` (`none`|`bearer`|`basic`|`mtls`)
+- `central_metrics_bearer_token` / `central_metrics_basic_user` / `central_metrics_basic_pass`
+- `metrics_ca_crt` / `metrics_client_crt` / `metrics_client_key` (PEM text)
+
+**Local VictoriaMetrics (optional)**
+- `install_local_vm` (`yes`/`no`)
+- `victoria_download_url` (Linux amd64 tar.gz)
+- `vm_retention_days` (default 30)
+
+**Logs → Loki (optional)**
+- `central_logs_loki_url`
+- `central_logs_auth_type` (`none`|`bearer`|`basic`|`mtls`)
+- `loki_bearer_token` / `loki_basic_user` / `loki_basic_pass`
+- `loki_ca_crt` / `loki_client_crt` / `loki_client_key`
+- `promtail_download_url`
+
+**Policy toggles**
+- `enable_blackbox` (`yes`/`no`, default `yes`)
+- `egress_enforced` (`yes`/`no`, default `no`)
+- `global_labels` (e.g. `env=prod,customer=acme`)
+
+**SSH-CA**
+- `ssh_ca_mode` (`yes`/`no`, default `yes`) – installs toolkit and playbooks
+- `user_cert_ttl_hours` (default 8)
+- `ansible_cert_ttl_hours` (default 2)
+- `host_cert_ttl_days` (default 60)
+
+---
+
+## 4) First boot – expected files and services
+
+- `/opt/mco` tree as above.
+- `/opt/mco/BASTION_PUBLIC_IP` file with detected public IP.
+- `sshd`, `fail2ban`, `squid`, `prometheus-node-exporter` active; `prometheus-blackbox-exporter` if enabled; `prometheus` **or** `alloy` active; optional `victoria-metrics` and `promtail` if enabled.
+- If anything fatally fails, the StackScript exits and writes `/root/stackscript_failure.log`.
+
+---
+
+## 5) Post-deployment checklist
+
+1. **SSH in as admin user** (e.g. `mcoadmin`) with your private key.
+2. Confirm services:
+   ```bash
+   systemctl is-active ssh || systemctl is-active sshd
+   systemctl is-active fail2ban
+   systemctl is-active squid
+   ss -lnpt | egrep ':(22|3128|9100|9115|8428)\b' || true
+   ```
+3. (Optional) Run the verifier if you installed it:
+   ```bash
+   sudo /opt/mco/bin/mco-verify.sh | tee /root/mco_verify_$(date +%F_%H%M%S).txt
+   ```
+
+---
+
+## 6) Managing engineer access to customer VMs
+
+### 6.1 Read-only keys → one shared Linux account on VMs
+- Drop engineers’ **public keys** here on the bastion:
+  ```
+  /opt/mco/keys/mco-readonly/*.pub
+  ```
+- Sync them into Ansible vars:
+  ```bash
+  sudo /opt/mco/bin/mco-ro-keys-sync
+  ```
+- Apply to customer VMs:
+  ```bash
+  cd /opt/mco/ansible
+  ansible-playbook -i inventory.ini playbooks_minimal.yml
+  ```
+  This ensures:
+  - Groups exist on VMs: `mco-readonly`, `mco-support`, `mco-admin`.
+  - A **single read-only** account (default `mco_ro`) exists with the synced keys.
+
+### 6.2 Support users (named accounts on VMs)
+- Place a `.pub` named after the user:
+  ```
+  /opt/mco/keys/mco-support/<username>.pub
+  ```
+- Declare the user in Ansible vars:
+  ```bash
+  sudo /opt/mco/bin/mco-add-support-user <username>
+  ```
+- Apply:
+  ```bash
+  cd /opt/mco/ansible && ansible-playbook -i inventory.ini playbooks_minimal.yml
+  ```
+
+### 6.3 Restrict VM SSH to bastion public IP
+```bash
+# BASTION_PUBLIC_IP was created on the bastion by the StackScript.
+cd /opt/mco/ansible
+ansible-playbook -i inventory.ini ufw_ssh_from_bastion.yml
+```
+
+---
+
+## 7) How engineers connect to VMs via the bastion
+
+### Option A: ProxyJump
+```bash
+ssh -J mcoadmin@<bastion_public_ip> <vm_user>@<vm_public_ip>
+```
+
+### Option B: Explicit tunnel for SSH
+```bash
+# From workstation
+ssh -N -L 10022:<vm_public_ip>:22 mcoadmin@<bastion_public_ip>
+
+# New terminal
+ssh -p 10022 <vm_user>@127.0.0.1
+```
+
+> The bastion enforces `AllowTcpForwarding yes`, `PermitOpen *:22`, and `PermitOpen 127.0.0.1:3128`, so these are permitted.
+
+---
+
+## 8) SSH-CA (short-lived SSH certificates)
+
+### 8.1 Install/enable toolkit
+- If you deployed with `ssh_ca_mode=yes`, the toolkit exists already.
+- For an existing bastion, run once:
+  ```bash
+  sudo /opt/mco/bin/mco-sshca-bootstrap.sh
+  ```
+  This will:
+  - Create **User CA** and **Host CA** under `/etc/ssh/ca/`.
+  - Push **User CA trust** and principals to all VMs (`ssh_ca_distribute.yml`).
+  - Optionally sign host keys (if `SIGN_HOST_KEYS=yes`).
+  - Issue an **ansible** user cert (default TTL 2h).
+  - Distribute the KRL (revocation list).
+
+### 8.2 Manual, step-by-step (if you prefer)
+```bash
+# 1) Create CA keys
+sudo /opt/mco/bin/mco-ca-init.sh
+
+# 2) Push trust/policies to VMs
+cd /opt/mco/ansible
+ansible-playbook -i inventory.ini ssh_ca_distribute.yml
+
+# 3) (Optional) Sign VM host keys
+ansible-playbook -i inventory.ini ssh_sign_hostkeys.yml
+echo "@cert-authority * $(cat /etc/ssh/ca/host_ca.pub)" | sudo tee -a /etc/ssh/ssh_known_hosts
+```
+
+**Principals mapping:**  
+`AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u` on VMs means the **file name** matches the **Linux user** you SSH into. The playbook creates:
+- `/etc/ssh/auth_principals/mco_ro` with principal `mco_ro`.
+- `/etc/ssh/auth_principals/ansible` with principal `ansible`.
+
+If your `inventory.ini` uses `ansible_user=ubuntu`, either change it to `ansible` or add a principals file on VMs:
+```bash
+ansible customer_vms -b -m copy -a "content='ansible\n' dest=/etc/ssh/auth_principals/ubuntu mode=0644"
+ansible customer_vms -b -m service -a 'name=ssh state=restarted'
+```
+
+**Issue a user cert:**
+```bash
+# Generic
+sudo /opt/mco/bin/mco-cert-user.sh <principal> </path/to/key.pub> 8h <bastion_public_ip>/32
+
+# For ansible (if ansible user exists on bastion)
+sudo /opt/mco/bin/mco-cert-ansible.sh 2h
+```
+
+**Revoke a key:**
+```bash
+sudo /opt/mco/bin/mco-krl-revoke.sh /path/to/compromised_key.pub
+ansible customer_vms -b -m copy -a 'src=/etc/ssh/ca/revoked_keys.krl dest=/etc/ssh/revoked_keys.krl mode=0644'
+ansible customer_vms -b -m service -a 'name=ssh state=restarted' --forks 10
+```
+
+---
+
+## 9) Kubernetes API access via bastion
+
+1. From workstation, open a local tunnel:
+   ```bash
+   ssh -N -L 16443:<api_server_host>:443 mcoadmin@<bastion_public_ip>
+   ```
+2. Copy `examples/kubeconfig.tpl` to your workstation and replace:
+   - `server: https://127.0.0.1:16443`
+   - `certificate-authority-data` with the cluster CA (base64)
+   - `token` (read-only)
+3. Lens: add a cluster with `https://127.0.0.1:16443`, use the kubeconfig above. Keep the SSH tunnel open while using Lens.
+
+---
+
+## 10) Monitoring, metrics, and logs
+
+- **node_exporter**: `127.0.0.1:9100`.
+- **blackbox_exporter** (if enabled): `127.0.0.1:9115`.
+- **Prometheus** config: `/etc/prometheus/prometheus.yml`.  
+  If `remote_write` UDFs are set, metrics forward to your platform. Auth/mTLS secrets are files in `/etc/mco/secrets/`.
+- **Alloy** (if chosen) reads `/etc/alloy/config.alloy` with remote_write endpoint and secrets injected.
+- **VictoriaMetrics** (if enabled): receiver on `127.0.0.1:8428`; if no other remote_write given, Prometheus is pointed at this URL.
+- **Promtail → Loki** (if enabled): `/etc/promtail.yaml`, credentials in `/etc/mco/secrets/`.
+- **mco-doctor** (if present): writes self-check metrics to `textfile_collector`, runs hourly via `mco-doctor.timer`.
+
+---
+
+## 11) Security controls on the bastion
+
+- **SSH**: No root login. No password auth. No keyboard-interactive (unless MFA enabled). Keys or SSH-CA certs only.
+- **Group-based login** via `AllowGroups`. Add/remove users from `mco-readonly`, `mco-support`, `mco-admin`, `bastion-admins` as appropriate.
+- **UFW** inbound: only your `allow_ssh_cidrs` on port 22.  
+  Outbound optional enforcement: if enabled, only DNS/NTP/HTTP/HTTPS allowed.
+- **Fail2ban** on SSH (aggressive).  
+- **Unattended upgrades** with auto-reboot at 03:30.  
+- **auditd**, **AIDE** (initialized once), **Lynis** scheduled weekly.  
+- **Squid** bound to loopback only and stripped headers.  
+- **Sysctl** hardened basics applied.
+
+---
+
+## 12) Day-2 operations
+
+### 12.1 Update packages
+```bash
+sudo apt-get update && sudo apt-get dist-upgrade -y
+```
+
+### 12.2 Update Ansible collection
+```bash
+cd /opt/mco/ansible
+ansible-galaxy collection install -r requirements.yml
+```
+
+### 12.3 Backups you must keep
+- `/etc/ssh/ca/user_ca` and `/etc/ssh/ca/host_ca` (private keys) – treat as sensitive secrets.
+- `/etc/mco/secrets/*` (tokens, passwords, mTLS keys).
+- `/opt/mco/ansible/*` (inventory, group_vars).
+- `/opt/mco/keys/*` if you want a record of who has access.
+
+### 12.4 Migrate to a new bastion
+- Restore CA keys and `/etc/mco/secrets/*`.
+- Restore `/opt/mco` tree.
+- Ensure `/opt/mco/BASTION_PUBLIC_IP` matches the new public IP and re-run `ufw_ssh_from_bastion.yml` on VMs.
+
+---
+
+## 13) Troubleshooting
+
+### 13.1 Cannot SSH into bastion
+- Use LISH/console.
+- Check:
+  ```bash
+  journalctl -u ssh -u sshd -n 100 --no-pager
+  sshd -T -C user=mcoadmin,host=$(hostname),addr=127.0.0.1 | egrep '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|authenticationmethods)'
+  grep -RInE '^\s*(PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|AuthenticationMethods)\b' /etc/ssh/sshd_config /etc/ssh/sshd_config.d
+  ```
+- Ensure your public key is correct and file perms are tight:
+  ```
+  chmod 700 ~mcoadmin/.ssh
+  chmod 600 ~mcoadmin/.ssh/authorized_keys
+  chown -R mcoadmin:mcoadmin ~mcoadmin/.ssh
+  ```
+- UFW/FW: confirm your source CIDR is allowed.
+
+### 13.2 Engineers can’t reach VMs through bastion
+- Confirm customer VM firewall allows **only** the bastion IP on 22/tcp:
+  ```bash
+  cd /opt/mco/ansible && ansible-playbook -i inventory.ini ufw_ssh_from_bastion.yml
+  ```
+- Use `ProxyJump` to avoid local port mistakes:
+  ```
+  ssh -J mcoadmin@<bastion_ip> <vm_user>@<vm_ip> -vv
+  ```
+
+### 13.3 Ansible connection fails
+- If using SSH-CA, verify VM has principals and TrustedUserCAKeys set (run `ssh_ca_distribute.yml` again).
+- If using the `ubuntu` account on VMs, add a principals file or switch `ansible_user` to `ansible`.
+- Check host key verification: add VM host keys with `/opt/mco/bin/add_known_host.sh <vm_ip>` or sign host keys with the CA playbook.
+
+### 13.4 Metrics not forwarding
+- Prometheus remote_write URL and auth files under `/etc/mco/secrets/`.
+- Systemd status:
+  ```bash
+  systemctl status prometheus alloy victoria-metrics promtail | cat
+  ```
+
+### 13.5 Create a support bundle
+```bash
+sudo /usr/local/bin/mco-support-bundle
+# prints the tar.gz path you can retrieve
+```
+
+---
+
+## 14) Ansible: end-to-end example
+
+1. **Edit inventory**:
+   ```
+   /opt/mco/ansible/inventory.ini
+   [customer_vms]
+   203.0.113.10
+   203.0.113.11
+
+   [customer_vms:vars]
+   ansible_user=ansible     # or ubuntu (see principals mapping)
+   become=yes
+   ```
+2. **Add engineers’ RO keys**:
+   ```
+   cp alice.pub /opt/mco/keys/mco-readonly/
+   cp bob.pub   /opt/mco/keys/mco-readonly/
+   sudo /opt/mco/bin/mco-ro-keys-sync
+   ```
+3. **Apply baseline** (groups/users/keys on VMs):
+   ```bash
+   cd /opt/mco/ansible
+   ansible-playbook -i inventory.ini playbooks_minimal.yml
+   ```
+4. **Restrict VM SSH to bastion**:
+   ```bash
+   ansible-playbook -i inventory.ini ufw_ssh_from_bastion.yml
+   ```
+5. **Enable SSH-CA** (one-command bootstrap):
+   ```bash
+   sudo /opt/mco/bin/mco-sshca-bootstrap.sh
+   ```
+6. **Run ad-hoc commands**:
+   ```bash
+   ansible customer_vms -m ping
+   ansible customer_vms -b -m apt -a 'update_cache=yes'
+   ```
+
+---
+
+## 15) Optional: MFA for bastion logins
+
+If `enable_mfa=yes` at deploy time, PAM Google Authenticator is enabled and SSH switches to `AuthenticationMethods publickey,keyboard-interactive`. Each user must run:
+```bash
+google-authenticator
+```
+and follow the prompts. Store emergency scratch codes securely.
+
+---
+
+## 16) Files and ports (reference)
+
+- SSH: tcp/22 (inbound limited by UFW CIDRs).  
+- Squid: 127.0.0.1:3128 (loopback only).  
+- node_exporter: 127.0.0.1:9100.  
+- blackbox_exporter: 127.0.0.1:9115 (if enabled).  
+- Prometheus: default distro ports (local only).  
+- VictoriaMetrics: 127.0.0.1:8428 (if enabled).  
+- Promtail: local agent; sends to Loki if configured.
+
+---
+
+## 17) Responsibility split
+
+- **Bastion**: Authentication, authorization, audit surface, jump/tunnel, Ansible control, optional CA issuance, optional local metric/log agent.
+- **Customer VMs**: Enforced SSH allowlist to bastion IP; local accounts/keys as pushed by Ansible; optional SSH-CA trust; their own OS updates and app configuration.
+
+---
+
+## 18) Change log guidance
+
+When you make changes (new keys, new support users, enabling SSH-CA, switching `ansible_user`, remote_write targets), note:
+- Timestamp, operator, purpose.
+- Files touched and commands run.
+- A quick verification result (e.g., `mco-verify.sh` output snippet).
+
+Keep this with your operational runbooks.
+
+---
+
+**End of README**
