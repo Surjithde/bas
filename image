@@ -1,0 +1,1297 @@
+#!/bin/bash
+# MCO Bastion v11 (full): Bastion + Ansible + Squid + Key mgmt + SSH CA + Monitoring + Kube helpers
+# Options: Prometheus (default) or Alloy, optional local VictoriaMetrics receiver, optional Promtail->Loki, egress allowlist
+# Security extras: AIDE init, Lynis weekly timer, minimal sysctl, fail2ban, UFW
+# Robust SSH hardening with *final include* so PRL/PA cannot be overridden.
+# Strict fail-fast validation (context-aware sshd -T -C) to avoid partial builds.
+
+# ---------------- UDFs ----------------
+# Core
+# <UDF name="admin_user" label="Primary bastion admin username" default="mcoadmin" />
+# <UDF name="admin_pubkey" label="Admin SSH public key (ed25519/RSA)" example="ssh-ed25519 AAAA... you@host" />
+# <UDF name="allow_ssh_cidrs" label="CIDRs allowed to SSH into bastion (CSV)" default="0.0.0.0/0" />
+# <UDF name="timezone" label="System timezone" default="UTC" />
+# <UDF name="enable_mfa" label="Enable TOTP MFA for SSH? (yes/no)" default="no" />
+# <UDF name="create_ansible_user" label="Create ansible user with NOPASSWD sudo? (yes/no)" default="yes" />
+# <UDF name="ansible_user_pubkey" label="Optional public key for ansible user" default="" />
+
+# Observability choice
+# <UDF name="observability_option" label="Observability stack (prometheus|alloy)" default="prometheus" />
+# <UDF name="alloy_download_url" label="If alloy: URL to alloy binary/tarball (Linux amd64)" default="" />
+
+# Metrics remote_write (optional; blank = local-only Prometheus)
+# <UDF name="central_metrics_remote_write_url" label="Remote write URL (leave blank for local-only)" default="" />
+# <UDF name="central_metrics_auth_type" label="Metrics auth (bearer|basic|mtls|none)" default="none" />
+# <UDF name="central_metrics_bearer_token" label="Metrics bearer token (if bearer)" default="" />
+# <UDF name="central_metrics_basic_user" label="Metrics basic user (if basic)" default="" />
+# <UDF name="central_metrics_basic_pass" label="Metrics basic password (if basic)" default="" />
+# <UDF name="metrics_ca_crt" label="Metrics CA PEM (if mTLS)" default="" />
+# <UDF name="metrics_client_crt" label="Metrics client cert PEM (if mTLS)" default="" />
+# <UDF name="metrics_client_key" label="Metrics client key PEM (if mTLS)" default="" />
+
+# Optional local VictoriaMetrics (loopback receiver)
+# <UDF name="install_local_vm" label="Install local VictoriaMetrics receiver on loopback? (yes/no)" default="no" />
+# <UDF name="victoria_download_url" label="VictoriaMetrics Linux amd64 tar.gz URL (if local VM=yes)" default="" />
+# <UDF name="vm_retention_days" label="VictoriaMetrics retention days" default="30" />
+
+# Logs -> Loki (optional)
+# <UDF name="central_logs_loki_url" label="Loki URL (HTTP/S, optional)" default="" />
+# <UDF name="central_logs_auth_type" label="Logs auth (bearer|basic|mtls|none)" default="none" />
+# <UDF name="loki_bearer_token" label="Loki bearer token (if bearer)" default="" />
+# <UDF name="loki_basic_user" label="Loki basic user (if basic)" default="" />
+# <UDF name="loki_basic_pass" label="Loki basic pass (if basic)" default="" />
+# <UDF name="loki_ca_crt" label="Loki CA PEM (if mTLS)" default="" />
+# <UDF name="loki_client_crt" label="Loki client cert PEM (if mTLS)" default="" />
+# <UDF name="loki_client_key" label="Loki client key PEM (if mTLS)" default="" />
+# <UDF name="promtail_download_url" label="Promtail tar.gz URL (optional)" default="" />
+
+# Policy toggles
+# <UDF name="enable_blackbox" label="Enable blackbox exporter? (yes/no)" default="yes" />
+# <UDF name="egress_enforced" label="Enforce outbound allowlist via UFW? (yes/no)" default="no" />
+# <UDF name="global_labels" label="Global labels for metrics (k=v,k=v)" default="" />
+
+# SSH CA mode
+# <UDF name="ssh_ca_mode" label="Enable SSH CA mode? (yes/no)" default="yes" />
+# <UDF name="user_cert_ttl_hours" label="User cert TTL hours" default="8" />
+# <UDF name="ansible_cert_ttl_hours" label="Ansible cert TTL hours" default="2" />
+# <UDF name="host_cert_ttl_days" label="Host cert TTL days" default="60" />
+
+# --- UDF normalization -------------------------------------------------------
+yn(){ case "${1,,}" in y|yes|true|1 ) echo yes;; * ) echo no;; esac; }
+
+# Accept either upper/lower-case UDF names from Linode and normalize to "yes"/"no"
+SSH_CA_MODE="$(yn "${SSH_CA_MODE:-${ssh_ca_mode:-yes}}")"
+USER_CERT_TTL_HOURS="${USER_CERT_TTL_HOURS:-${user_cert_ttl_hours:-8}}"
+ANSIBLE_CERT_TTL_HOURS="${ANSIBLE_CERT_TTL_HOURS:-${ansible_cert_ttl_hours:-2}}"
+HOST_CERT_TTL_DAYS="${HOST_CERT_TTL_DAYS:-${host_cert_ttl_days:-60}}"
+
+# Backfill lowercase vars for any downstream references
+ssh_ca_mode="${ssh_ca_mode:-$SSH_CA_MODE}"
+user_cert_ttl_hours="${user_cert_ttl_hours:-$USER_CERT_TTL_HOURS}"
+ansible_cert_ttl_hours="${ansible_cert_ttl_hours:-$ANSIBLE_CERT_TTL_HOURS}"
+host_cert_ttl_days="${host_cert_ttl_days:-$HOST_CERT_TTL_DAYS}"
+
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+LOG_FILE="/root/stackscript_failure.log"
+
+log(){ echo "[INFO] $*"; }
+err(){ echo "[ERROR] $*" | tee -a "$LOG_FILE" 1>&2; }
+die(){ err "$*"; exit 1; }
+trap 'err "Failed at line ${LINENO}: ${BASH_COMMAND}"; exit 1' ERR
+retry(){ local a="$1"; shift; local d="$1"; shift; local n=1; until "$@"; do if (( n>=a )); then err "[RETRY] failed after $n attempts: $*"; return 1; fi; sleep "$d"; ((n++)); done; }
+wait_port(){ local h="$1" p="$2" t="$3" i=0; while ((i<t)); do nc -z -w1 "$h" "$p" 2>/dev/null && return 0; sleep 1; ((i++)); done; return 1; }
+write_secret(){ local p="$1" v="${2:-}"; [ -z "$v" ] && return 0; printf "%s\n" "$v" > "$p"; chmod 600 "$p"; }
+
+# Required UDFs
+: "${ADMIN_USER:?admin_user empty}"
+: "${ADMIN_PUBKEY:?admin_pubkey empty}"
+: "${ALLOW_SSH_CIDRS:?allow_ssh_cidrs empty}"
+: "${TIMEZONE:?timezone empty}"
+: "${CREATE_ANSIBLE_USER:?create_ansible_user empty}"
+
+# Optional UDFs
+ENABLE_MFA="${ENABLE_MFA:-no}"
+ANSIBLE_USER_PUBKEY="${ANSIBLE_USER_PUBKEY:-}"
+OBS_OPT="${OBSERVABILITY_OPTION:-prometheus}"
+ALLOY_URL="${ALLOY_DOWNLOAD_URL:-}"
+CENTRAL_METRICS_REMOTE_WRITE_URL="${CENTRAL_METRICS_REMOTE_WRITE_URL:-}"
+CENTRAL_METRICS_AUTH_TYPE="${CENTRAL_METRICS_AUTH_TYPE:-none}"
+CENTRAL_METRICS_BEARER_TOKEN="${CENTRAL_METRICS_BEARER_TOKEN:-}"
+CENTRAL_METRICS_BASIC_USER="${CENTRAL_METRICS_BASIC_USER:-}"
+CENTRAL_METRICS_BASIC_PASS="${CENTRAL_METRICS_BASIC_PASS:-}"
+METRICS_CA_CRT="${METRICS_CA_CRT:-}"
+METRICS_CLIENT_CRT="${METRICS_CLIENT_CRT:-}"
+METRICS_CLIENT_KEY="${METRICS_CLIENT_KEY:-}"
+INSTALL_LOCAL_VM="${INSTALL_LOCAL_VM:-no}"
+VM_URL="${VICTORIA_DOWNLOAD_URL:-}"
+VM_RETENTION="${VM_RETENTION_DAYS:-30}"
+CENTRAL_LOGS_LOKI_URL="${CENTRAL_LOGS_LOKI_URL:-}"
+CENTRAL_LOGS_AUTH_TYPE="${CENTRAL_LOGS_AUTH_TYPE:-none}"
+LOKI_BEARER_TOKEN="${LOKI_BEARER_TOKEN:-}"
+LOKI_BASIC_USER="${LOKI_BASIC_USER:-}"
+LOKI_BASIC_PASS="${LOKI_BASIC_PASS:-}"
+LOKI_CA_CRT="${LOKI_CA_CRT:-}"
+LOKI_CLIENT_CRT="${LOKI_CLIENT_CRT:-}"
+LOKI_CLIENT_KEY="${LOKI_CLIENT_KEY:-}"
+PROMTAIL_URL="${PROMTAIL_DOWNLOAD_URL:-}"
+ENABLE_BLACKBOX="${ENABLE_BLACKBOX:-yes}"
+EGRESS_ENFORCED="${EGRESS_ENFORCED:-no}"
+GLOBAL_LABELS="${GLOBAL_LABELS:-}"
+SSH_CA_MODE="${SSH_CA_MODE:-yes}"
+USER_CERT_TTL="${USER_CERT_TTL_HOURS:-8}"
+ANSIBLE_CERT_TTL="${ANSIBLE_CERT_TTL_HOURS:-2}"
+HOST_CERT_TTL="${HOST_CERT_TTL_DAYS:-60}"
+
+# ---------- /opt/mco scaffold ----------
+MCO_DIR="/opt/mco"
+mkdir -p "${MCO_DIR}/ansible/group_vars" "${MCO_DIR}/ansible/host_vars" \
+         "${MCO_DIR}/keys/mco-readonly" "${MCO_DIR}/keys/mco-support" \
+         "${MCO_DIR}/bin" "${MCO_DIR}/examples" "${MCO_DIR}/monitoring/dashboards" \
+         /etc/mco/secrets /var/lib/node_exporter/textfile_collector /etc/mco/kube
+chmod -R 750 "${MCO_DIR}" || true
+chmod 700 /etc/mco/secrets
+
+# README (on-box)
+cat >"${MCO_DIR}/README.md" <<'EOF'
+# MCO Bastion Overview (v11)
+- Hardened SSH bastion with group-based RBAC and SSH tunnel policy.
+- Key folders: /opt/mco/keys/mco-readonly and mco-support.
+- Ansible control host, inventory, and minimal playbooks.
+- Optional SSH CA (short-lived certs) + KRL revoke.
+- Squid loopback proxy on 127.0.0.1:3128.
+- node_exporter + optional blackbox_exporter.
+- Prometheus (default) or Alloy; optional local VictoriaMetrics; optional Promtail->Loki.
+- Egress allowlist (optional).
+- Security extras: AIDE init, Lynis weekly timer, minimal sysctl.
+- Kube API tunnel helpers for Lens/kubectl.
+EOF
+
+# Keys README
+cat >"${MCO_DIR}/keys/README.txt" <<'EOF'
+Drop SSH public keys here and sync:
+- Read-only keys: /opt/mco/keys/mco-readonly/*.pub  -> mco_ro
+- Support users:  /opt/mco/keys/mco-support/<username>.pub
+
+Commands:
+  sudo /opt/mco/bin/mco-ro-keys-sync
+  sudo /opt/mco/bin/mco-add-support-user <username>
+
+Apply to VMs:
+  cd /opt/mco/ansible && ansible-playbook -i inventory.ini playbooks_minimal.yml
+EOF
+
+# Ansible inventory/vars/cfg/requirements
+cat >"${MCO_DIR}/ansible/inventory.ini" <<'EOF'
+[customer_vms]
+# 203.0.113.10
+# 203.0.113.11
+
+[customer_vms:vars]
+ansible_user=ubuntu
+become=yes
+EOF
+
+cat >"${MCO_DIR}/ansible/group_vars/all.yml" <<'EOF'
+mco_groups: [mco-readonly, mco-support, mco-admin]
+mco_readonly_user: mco_ro
+mco_readonly_shell: /bin/bash
+mco_readonly_create: true
+mco_readonly_authorized_keys: []
+mco_support_users: []
+EOF
+
+cat >"${MCO_DIR}/ansible/ansible.cfg" <<'EOF'
+[defaults]
+inventory = ./inventory.ini
+host_key_checking = True
+log_path = /opt/mco/ansible/ansible.log
+retry_files_enabled = False
+deprecation_warnings = False
+stdout_callback = yaml
+callbacks_enabled = timer, profile_tasks
+
+[ssh_connection]
+ssh_args = -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/ssh/ssh_known_hosts
+pipelining = True
+EOF
+
+cat >"${MCO_DIR}/ansible/requirements.yml" <<'EOF'
+---
+collections:
+  - name: community.general
+EOF
+
+# Known hosts helper
+install -d -m 755 /etc/ssh
+touch /etc/ssh/ssh_known_hosts
+chmod 644 /etc/ssh/ssh_known_hosts
+
+cat >"${MCO_DIR}/bin/add_known_host.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+HOST="${1:-}"; [ -z "$HOST" ] && { echo "Usage: $0 <host_or_ip>"; exit 1; }
+ssh-keyscan -H "$HOST" 2>/dev/null | sort -u | grep -v '^#' >> /etc/ssh/ssh_known_hosts
+sort -u -o /etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts
+echo "[ok] added $HOST to /etc/ssh/ssh_known_hosts"
+EOF
+chmod +x "${MCO_DIR}/bin/add_known_host.sh"
+
+# Key mgmt helpers
+cat >"${MCO_DIR}/bin/mco-ro-keys-sync" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+DIR="/opt/mco/keys/mco-readonly"; YAML="/opt/mco/ansible/group_vars/all.yml"
+[ -d "$DIR" ] || { echo "Missing $DIR"; exit 1; }
+TMP="$(mktemp)"; awk '1' "$YAML" > "$TMP"
+grep -q '^mco_readonly_authorized_keys:' "$TMP" || echo "mco_readonly_authorized_keys:" >> "$TMP"
+while IFS= read -r -d '' f; do k="$(tr -d '\r' < "$f")"; grep -F "  - $k" "$TMP" >/dev/null || printf "  - %s\n" "$k" >> "$TMP"; done < <(find "$DIR" -type f -name '*.pub' -print0)
+mv "$TMP" "$YAML"; echo "[ok] synced read-only keys into $YAML"
+EOF
+chmod +x "${MCO_DIR}/bin/mco-ro-keys-sync"
+
+cat >"${MCO_DIR}/bin/mco-add-ro-key" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+KEY="${1:-}"; [ -z "$KEY" ] && { echo "Usage: $0 'ssh-ed25519 AAA... comment'"; exit 1; }
+YAML="/opt/mco/ansible/group_vars/all.yml"
+grep -F -- "$KEY" "$YAML" >/dev/null || printf "  - %s\n" "$KEY" >> "$YAML"
+echo "[ok] Added to mco_readonly_authorized_keys"
+EOF
+chmod +x "${MCO_DIR}/bin/mco-add-ro-key"
+
+cat >"${MCO_DIR}/bin/mco-add-support-user" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+USER="${1:-}"; [ -z "$USER" ] && { echo "Usage: $0 <username>"; exit 1; }
+PUB="/opt/mco/keys/mco-support/${USER}.pub"; [ -f "$PUB" ] || { echo "Missing $PUB"; exit 1; }
+KEY="$(tr -d '\r' < "$PUB")"; YAML="/opt/mco/ansible/group_vars/all.yml"
+sed -i '/^mco_support_users:/a \  - { name: '"\"$USER\""', pubkey: '"\"$KEY\""'}' "$YAML"
+echo "[ok] Declared support user ${USER}"
+EOF
+chmod +x "${MCO_DIR}/bin/mco-add-support-user"
+
+#---start-3-tool-add----#
+# mco-get-cert: engineers self-issue short-lived SSH certs (reads pubkey from STDIN, prints cert to STDOUT)
+cat >"${MCO_DIR}/bin/mco-get-cert" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+USER_CA="/etc/ssh/ca/user_ca"
+BIP_FILE="/opt/mco/BASTION_PUBLIC_IP"
+MAX_RO_TTL_H=24
+MAX_ADM_TTL_H=8
+me="${SUDO_USER:-$USER}"
+
+require(){ command -v "$1" >/dev/null || { echo "missing: $1" >&2; exit 1; }; }
+require ssh-keygen
+[ -f "$USER_CA" ] || { echo "User CA missing at $USER_CA" >&2; exit 1; }
+
+# Determine principal: default mco_ro; admins may request mco_admin
+groups="$(id -nG "$me" 2>/dev/null || true)"
+principal="${1:-}"
+if [ -z "$principal" ]; then
+  principal="mco_ro"
+  if echo "$groups" | grep -qwE '(mco-admin|bastion-admins)'; then principal="mco_admin"; fi
+fi
+# Enforce allowed principals
+if echo "$groups" | grep -qwE '(mco-admin|bastion-admins)'; then
+  : # allowed: mco_admin or mco_ro
+else
+  [ "$principal" = "mco_ro" ] || { echo "not allowed principal: $principal" >&2; exit 1; }
+fi
+
+# TTL handling (default: 8h RO, 2h admin). Accept Xm or Xh; bound by policy.
+ttl_in="${2:-}"
+if [ -z "$ttl_in" ]; then
+  if [ "$principal" = "mco_admin" ]; then ttl_in="2h"; else ttl_in="8h"; fi
+fi
+case "$ttl_in" in
+  *h) ttl_h="${ttl_in%h}" ;;
+  *m) ttl_h=$(( ( ${ttl_in%m} + 59 ) / 60 )) ;;
+  *)  echo "Bad TTL: $ttl_in" >&2; exit 1 ;;
+esac
+max="$MAX_RO_TTL_H"; [ "$principal" = "mco_admin" ] && max="$MAX_ADM_TTL_H"
+[ "$ttl_h" -gt 0 ] && [ "$ttl_h" -le "$max" ] || { echo "TTL out of bounds" >&2; exit 1; }
+TTL="${ttl_h}h"
+
+# Read a single public key from STDIN
+tmpdir="$(mktemp -d)"; trap 'rm -rf "$tmpdir"' EXIT
+pub="$tmpdir/in.pub"
+cat >"$pub"
+head -n1 "$pub" | grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp256)\s+' || { echo "invalid public key" >&2; exit 1; }
+
+# Lock cert to bastion public IP if known
+src_opt=()
+if [ -s "$BIP_FILE" ]; then src_opt=(-O "source-address=$(cat "$BIP_FILE")/32"); fi
+
+id_str="${me}-$(date -u +%Y%m%dT%H%M%SZ)"
+serial="$(date +%s)"
+ssh-keygen -q -s "$USER_CA" -I "$id_str" -n "$principal" -V "+${TTL}" -z "$serial" "${src_opt[@]}" "$pub"
+
+# ssh-keygen writes <pub>-cert.pub; stream it out
+cat "${pub}-cert.pub"
+EOF
+chmod 755 "${MCO_DIR}/mco-get-cert"
+
+# mco-inventory-sync: build /opt/mco/ansible/inventory.ini from Linode API by tag
+# Requires env vars: LINODE_TOKEN and CUSTOMER_TAG (e.g., customer:acme)
+cat >"${MCO_DIR}/bin/mco-inventory-sync" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+OUT="/opt/mco/ansible/inventory.ini"
+: "${LINODE_TOKEN:?Set LINODE_TOKEN env var}"
+: "${CUSTOMER_TAG:?Set CUSTOMER_TAG env var (e.g., customer:acme)}"
+
+command -v jq >/dev/null || { apt-get update -y && apt-get install -y jq >/dev/null; }
+
+install -d -m 755 /opt/mco/ansible
+TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
+PAGE=1
+> "$TMP"
+while :; do
+  DATA="$(curl -sfS -H "Authorization: Bearer ${LINODE_TOKEN}" \
+                "https://api.linode.com/v4/linode/instances?page=${PAGE}&page_size=500")"
+  echo "$DATA" | jq -r --arg TAG "$CUSTOMER_TAG" '
+    .data[]
+    | select((.tags|index($TAG)) and (.ipv4 != null) and (.status=="running" or .status=="offline"))
+    | .ipv4[]' >> "$TMP"
+  PAGES="$(echo "$DATA" | jq -r ".pages")"
+  [ "$PAGE" -ge "$PAGES" ] && break
+  PAGE=$((PAGE+1))
+done
+
+{
+  echo "[customer_vms]"
+  sort -V "$TMP" | uniq
+  echo
+  echo "[customer_vms:vars]"
+  echo "ansible_user=ansible"
+  echo "become=yes"
+} > "$OUT"
+
+echo "[OK] wrote $OUT"
+EOF
+chmod 755 "${MCO_DIR}/bin/mco-inventory-sync"
+
+# mco-doctor: emit lightweight health metrics for Prometheus textfile collector + brief stdout summary
+cat >"${MCO_DIR}/bin/mco-doctor" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+choose_dir() {
+  for d in /var/lib/node_exporter/textfile_collector /var/lib/prometheus/node-exporter; do
+    if [ -d "$d" ]; then echo "$d"; return; fi
+  done
+  install -d -m 755 /var/lib/node_exporter/textfile_collector
+  echo /var/lib/node_exporter/textfile_collector
+}
+OUTDIR="$(choose_dir)"
+OUT="${OUTDIR}/mco_doctor.prom"
+TMP="$(mktemp)"; trap 'rm -f "$TMP"' EXIT
+
+is_active(){ systemctl is-active --quiet "$1" && echo 1 || echo 0; }
+is_listening(){ nc -z 127.0.0.1 "$1" >/dev/null 2>&1 && echo 1 || echo 0; }
+
+ts="$(date +%s)"
+ssh_ok="$(is_active ssh || is_active sshd)"
+fail2ban_ok="$(is_active fail2ban)"
+squid_ok="$(is_active squid)"
+nodeexp_ok="$(is_listening 9100)"
+blackbox_ok="$(is_listening 9115)"
+proxy_ok="$(is_listening 3128)"
+ufw_active="$(ufw status 2>/dev/null | grep -q 'Status: active' && echo 1 || echo 0)"
+ssh_ca_mode="$( [ -s /etc/mco/features/ssh_ca_mode ] && echo 1 || echo 0)"
+free_mem_mb="$(free -m | awk '/Mem:/ {print $7}')"
+disk_root_pct="$(df -P / | awk 'NR==2 {print $5}' | tr -d '%')"
+open_files="$(cat /proc/sys/fs/file-nr 2>/dev/null | awk '{print $1}')"
+
+{
+  echo "# HELP mco_bastion_service_up 1 if service is healthy"
+  echo "# TYPE mco_bastion_service_up gauge"
+  echo "mco_bastion_service_up{service=\"ssh\"} $ssh_ok"
+  echo "mco_bastion_service_up{service=\"fail2ban\"} $fail2ban_ok"
+  echo "mco_bastion_service_up{service=\"squid\"} $squid_ok"
+  echo "mco_bastion_port_listen{port=\"3128\"} $proxy_ok"
+  echo "mco_bastion_port_listen{port=\"9100\"} $nodeexp_ok"
+  echo "mco_bastion_port_listen{port=\"9115\"} $blackbox_ok"
+  echo "mco_bastion_ufw_active $ufw_active"
+  echo "mco_bastion_ssh_ca_mode $ssh_ca_mode"
+  echo "mco_bastion_free_mem_megabytes $free_mem_mb"
+  echo "mco_bastion_disk_root_used_percent $disk_root_pct"
+  echo "mco_bastion_open_files $open_files"
+  echo "mco_bastion_timestamp_seconds $ts"
+} >"$TMP"
+
+install -m 644 "$TMP" "$OUT"
+printf "ssh:%s fail2ban:%s squid:%s proxy(3128):%s nodeexp(9100):%s blackbox(9115):%s ufw:%s ca:%s free_mem_mb:%s disk_root_used%%:%s\n" \
+  "$ssh_ok" "$fail2ban_ok" "$squid_ok" "$proxy_ok" "$nodeexp_ok" "$blackbox_ok" "$ufw_active" "$ssh_ca_mode" "$free_mem_mb" "$disk_root_pct"
+EOF
+chmod 755 "${MCO_DIR}/bin/mco-doctor"
+
+# systemd unit & timer for mco-doctor (every 15 minutes)
+cat >/etc/systemd/system/mco-doctor.service <<'EOF'
+[Unit]
+Description=MCO Doctor - emit textfile metrics
+[Service]
+Type=oneshot
+ExecStart=/opt/mco/bin/mco-doctor
+EOF
+
+cat >/etc/systemd/system/mco-doctor.timer <<'EOF'
+[Unit]
+Description=Run MCO Doctor every 15 minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=mco-doctor.service
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now mco-doctor.timer || true
+# --- end 3-tool add ---
+
+#----verify script add------
+cat >"${MCO_DIR}/bin/mco-verify.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[ "${EUID:-$(id -u)}" -eq 0 ] || exec sudo -n bash "$0" "$@"
+
+ok(){ echo "[OK]  $*"; }; warn(){ echo "[WARN] $*"; }; fail(){ echo "[FAIL] $*"; F=1; }
+F=0
+
+# Change if your admin username differs; or pass ADMIN_USER=foo env var
+ADMIN_USER="${ADMIN_USER:-mcoadmin}"
+HOST="$(hostname)"
+FINAL_F=/etc/ssh/sshd_config.d/zz-mco-final.conf
+BASE_F=/etc/ssh/sshd_config.d/60-mco-hardening.conf
+
+echo "== Services =="
+(systemctl is-active --quiet ssh || systemctl is-active --quiet sshd) && ok "ssh active" || fail "ssh inactive"
+systemctl is-active --quiet fail2ban && ok "fail2ban active" || fail "fail2ban inactive"
+systemctl is-active --quiet squid && ok "squid active" || fail "squid inactive"
+
+echo "== Proxy socket =="
+command -v nc >/dev/null && nc -z -w1 127.0.0.1 3128 && ok "127.0.0.1:3128 listening" || fail "proxy not listening"
+
+echo "== SSH config (connection context) =="
+CTX="$(sshd -T -C user=${ADMIN_USER},host=${HOST},addr=127.0.0.1 2>/dev/null || true)"
+echo "$CTX" | grep -q '^permitrootlogin no$'        && ok "PermitRootLogin no" || fail "PRL not set"
+echo "$CTX" | grep -q '^passwordauthentication no$'  && ok "PasswordAuthentication no" || fail "PA not set"
+if grep -q 'pam_google_authenticator.so' /etc/pam.d/sshd 2>/dev/null; then
+  ok "MFA detected; KI may be enabled"
+else
+  echo "$CTX" | grep -q '^kbdinteractiveauthentication no$' && ok "KbdInteractiveAuthentication no" || fail "KI not set"
+  echo "$CTX" | grep -q '^authenticationmethods publickey$' && ok "AuthMethods publickey" || fail "AuthMethods not publickey"
+fi
+grep -q '^PermitOpen 127.0.0.1:3128' "$BASE_F" 2>/dev/null && ok "PermitOpen proxy" || fail "PermitOpen proxy missing"
+grep -q '^PermitOpen \*:22'          "$BASE_F" 2>/dev/null && ok "PermitOpen *:22" || fail "PermitOpen *:22 missing"
+tail -n5 /etc/ssh/sshd_config | grep -q "$FINAL_F" && ok "Final include parsed last" || fail "Final include not last"
+
+echo "== Groups & membership =="
+for g in mco-readonly mco-support mco-admin bastion-admins; do
+  getent group "$g" >/dev/null && ok "group exists: $g" || fail "missing group: $g"
+done
+id -nG "$ADMIN_USER" 2>/dev/null | grep -qw bastion-admins && ok "admin in bastion-admins" || fail "admin not in bastion-admins"
+[ -f "/etc/sudoers.d/10-admin-nopasswd" ] && grep -q "$ADMIN_USER" /etc/sudoers.d/10-admin-nopasswd && ok "NOPASSWD sudo for $ADMIN_USER" || fail "NOPASSWD sudo missing"
+
+echo "== Firewall (UFW) =="
+ufw status 2>/dev/null | grep -q "Status: active" && ok "UFW active" || fail "UFW inactive"
+ufw status 2>/dev/null | grep -Eq "22/tcp.*ALLOW" && ok "SSH allow rule present" || warn "No explicit UFW allow rule for 22/tcp found"
+
+echo "== Exporters =="
+(command -v nc >/dev/null && nc -z -w1 127.0.0.1 9100) && ok "node_exporter 9100" || fail "node_exporter not listening"
+if systemctl is-active --quiet prometheus-blackbox-exporter; then
+  nc -z -w1 127.0.0.1 9115 && ok "blackbox_exporter 9115" || fail "blackbox_exporter not listening"
+else
+  warn "blackbox_exporter disabled"
+fi
+
+echo "== Ansible & /opt/mco =="
+command -v ansible >/dev/null && ok "Ansible installed" || fail "Ansible missing"
+ansible-galaxy collection list 2>/dev/null | grep -q 'community.general' && ok "community.general present" || fail "community.general missing"
+for f in \
+  /opt/mco/ansible/inventory.ini \
+  /opt/mco/ansible/group_vars/all.yml \
+  /opt/mco/ansible/playbooks_minimal.yml \
+  /opt/mco/ansible/ansible.cfg \
+  /opt/mco/ansible/requirements.yml \
+  /opt/mco/bin/mco-ro-keys-sync \
+  /opt/mco/bin/mco-add-ro-key \
+  /opt/mco/bin/mco-add-support-user \
+  /opt/mco/bin/add_known_host.sh \
+  /opt/mco/bin/mco-kube-make-tunnel.sh \
+  /opt/mco/README.md
+do
+  [ -e "$f" ] && ok "present: $f" || fail "missing: $f"
+done
+
+echo "== SSH CA Toolkit (if enabled) =="
+for s in mco-ca-init.sh mco-cert-user.sh mco-cert-ansible.sh mco-krl-revoke.sh; do
+  if [ -x "/opt/mco/bin/$s" ]; then ok "$s present"; else warn "$s missing (CA mode may be off)"; fi
+done
+for p in /opt/mco/ansible/ssh_ca_distribute.yml /opt/mco/ansible/ssh_sign_hostkeys.yml; do
+  [ -f "$p" ] && ok "present: $p" || warn "missing: $p"
+done
+
+echo "== New tools & timers =="
+
+# 1) Tools present & executable
+for t in /opt/mco/bin/mco-get-cert /opt/mco/bin/mco-inventory-sync /opt/mco/bin/mco-doctor; do
+  if [ -x "$t" ]; then ok "present & executable: $t"; else fail "missing or not executable: $t"; fi
+done
+
+# 2) mco-get-cert related (needs User CA, optional bastion IP stamp)
+if [ -x /opt/mco/bin/mco-get-cert ]; then
+  if [ -s /etc/ssh/ca/user_ca ]; then ok "User CA present: /etc/ssh/ca/user_ca"; else warn "User CA missing (mco-get-cert will fail)"; fi
+  if [ -s /etc/mco/features/ssh_ca_mode ]; then ok "ssh_ca_mode stamp present"; else warn "ssh_ca_mode not stamped (CA may be disabled)"; fi
+  if [ -s /opt/mco/BASTION_PUBLIC_IP ]; then ok "BASTION_PUBLIC_IP recorded"; else warn "BASTION_PUBLIC_IP not recorded (certs won't be source-locked)"; fi
+fi
+
+# 3) mco-inventory-sync related (env + output)
+if [ -x /opt/mco/bin/mco-inventory-sync ]; then
+  if [ -s /etc/mco/linode.env ]; then ok "linode.env present (LINODE_TOKEN/CUSTOMER_TAG)"; else warn "linode.env missing (inventory sync optional)"; fi
+  if [ -s /opt/mco/ansible/inventory.ini ]; then ok "inventory.ini present"; else warn "inventory.ini not generated yet (run mco-inventory-sync)"; fi
+fi
+
+# 4) mco-doctor timer + metrics freshness
+if [ -x /opt/mco/bin/mco-doctor ]; then
+  if systemctl is-active --quiet mco-doctor.timer 2>/dev/null; then ok "mco-doctor.timer active"; else warn "mco-doctor.timer inactive"; fi
+
+  PROM_FILE=""
+  for d in /var/lib/node_exporter/textfile_collector /var/lib/prometheus/node-exporter; do
+    [ -d "$d" ] && PROM_FILE="$d/mco_doctor.prom" && break
+  done
+  if [ -n "$PROM_FILE" ] && [ -s "$PROM_FILE" ]; then
+    if find "$PROM_FILE" -mmin -30 -print -quit 2>/dev/null | grep -q .; then
+      ok "mco_doctor.prom fresh (<30m): $PROM_FILE"
+    else
+      warn "mco_doctor.prom stale (>30m): $PROM_FILE"
+    fi
+  else
+    warn "mco_doctor.prom missing (will appear after timer runs)"
+  fi
+fi
+
+if [ "${F:-0}" = "0" ]; then
+  echo "Verification PASSED"
+  exit 0
+else
+  echo "Verification had FAILURES"
+  exit 1
+fi
+EOF
+chmod +x "${MCO_DIR}/bin/mco-verify.sh"
+
+# Baseline playbook
+cat >"${MCO_DIR}/ansible/playbooks_minimal.yml" <<'EOF'
+---
+- name: Minimal MCO baseline on customer VMs (groups + single readonly user + optional support users)
+  hosts: customer_vms
+  become: true
+  vars_files: [group_vars/all.yml]
+  tasks:
+    - name: Ensure MCO groups exist
+      group: { name: "{{ item }}", state: present }
+      loop: "{{ mco_groups }}"
+
+    - name: Create single readonly user (no sudo)
+      when: mco_readonly_create | bool
+      user: { name: "{{ mco_readonly_user }}", shell: "{{ mco_readonly_shell }}", create_home: true, state: present }
+
+    - name: Ensure .ssh dir for readonly user
+      when: mco_readonly_create | bool
+      file: { path: "/home/{{ mco_readonly_user }}/.ssh", state: directory, owner: "{{ mco_readonly_user }}", group: "{{ mco_readonly_user }}", mode: '0700' }
+
+    - name: Authorized keys for readonly user
+      when: mco_readonly_create | bool
+      authorized_key: { user: "{{ mco_readonly_user }}", key: "{{ item }}", state: present, manage_dir: false }
+      loop: "{{ mco_readonly_authorized_keys }}"
+
+    - name: Create support users (if any)
+      loop: "{{ mco_support_users }}"
+      loop_control: { label: "{{ item.name | default('unset') }}" }
+      user: { name: "{{ item.name }}", shell: /bin/bash, create_home: true, state: present }
+
+    - name: Set support users' authorized_keys
+      when: mco_support_users | length > 0
+      authorized_key: { user: "{{ item.name }}", key: "{{ item.pubkey }}", state: present }
+      loop: "{{ mco_support_users }}"
+EOF
+
+# UFW bastion-only
+cat >"${MCO_DIR}/ansible/ufw_ssh_from_bastion.yml" <<'EOF'
+---
+- name: Enforce SSH-from-bastion-only via UFW
+  hosts: customer_vms
+  become: true
+  gather_facts: false
+  collections: [ community.general ]
+  vars:
+    bastion_ipv4: "{{ lookup('file', '/opt/mco/BASTION_PUBLIC_IP') | trim | default('SET_ME', true) }}"
+    ssh_port: 22
+  pre_tasks:
+    - fail: { msg: "bastion_ipv4 not set; fill /opt/mco/BASTION_PUBLIC_IP or override var." }
+      when: bastion_ipv4 in ['SET_ME', '']
+    - package: { name: ufw, state: present }
+  tasks:
+    - name: Reset UFW to deny incoming / allow outgoing
+      community.general.ufw: { state: reset, logging: 'on', direction: incoming, policy: deny }
+    - community.general.ufw: { direction: outgoing, policy: allow }
+    - community.general.ufw: { state: enabled }
+    - name: Allow SSH only from bastion
+      community.general.ufw: { rule: allow, src: "{{ bastion_ipv4 }}/32", port: "{{ ssh_port }}", proto: tcp }
+EOF
+
+# Kube helpers
+cat >"${MCO_DIR}/examples/kubeconfig.tpl" <<'EOF'
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: REPLACE_BASE64_CA
+    server: https://127.0.0.1:16443
+  name: cluster1
+contexts:
+- context:
+    cluster: cluster1
+    user: ro-user
+  name: cluster1
+current-context: cluster1
+users:
+- name: ro-user
+  user:
+    token: REPLACE_BEARER_OR_LEAVE_EMPTY
+EOF
+
+cat >"${MCO_DIR}/bin/mco-kube-make-tunnel.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Usage: mco-kube-make-tunnel.sh <name> <api_hostname> [local_port=16443] [bastion_user=mcoadmin]
+NAME="${1:-}"; API="${2:-}"; LPORT="${3:-16443}"; BUSER="${4:-mcoadmin}"
+[ -z "$NAME" ] || [ -z "$API" ] && { echo "Usage: $0 <name> <api_hostname> [local_port] [bastion_user]"; exit 1; }
+CONF_DIR="/etc/mco/kube/${NAME}"
+install -d -m 755 "$CONF_DIR"
+echo "API_HOST=${API}" > "${CONF_DIR}/env"
+echo "LOCAL_PORT=${LPORT}" >> "${CONF_DIR}/env"
+echo "BASTION_USER=${BUSER}" >> "${CONF_DIR}/env"
+echo "[ok] Wrote ${CONF_DIR}/env"
+echo "Start tunnel from engineer workstation:"
+echo "  ssh -N -L ${LPORT}:${API}:443 ${BUSER}@<bastion-public-ip>"
+EOF
+chmod +x "${MCO_DIR}/bin/mco-kube-make-tunnel.sh"
+
+# Bastion public IP hint
+PUB_IP="$((curl -4 -fsSL https://api.ipify.org || true) || (curl -4 -fsSL https://ifconfig.co || true) || (ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n1 || true))"
+PUB_IP="${PUB_IP:-SET_ME}"
+echo "${PUB_IP}" > "${MCO_DIR}/BASTION_PUBLIC_IP"
+
+# ---------------- OS + Packages ----------------
+log "Timezone & packages"
+timedatectl set-timezone "$TIMEZONE" || true
+retry 5 8 apt-get update -y
+retry 5 8 apt-get install -y software-properties-common ca-certificates gnupg
+add-apt-repository -y ppa:ansible/ansible || true
+add-apt-repository -y universe || true
+retry 5 8 apt-get update -y
+retry 5 8 apt-get dist-upgrade -y
+retry 5 8 apt-get install -y \
+  ufw fail2ban unattended-upgrades apt-listchanges \
+  openssh-server auditd python3 python3-pip python3-venv git jq curl \
+  htop vim tmux zip unzip netcat-openbsd autossh socat \
+  prometheus-node-exporter prometheus-blackbox-exporter \
+  lynis aide aide-common squid ansible
+
+# Ensure Ansible + collection
+if ! command -v ansible >/dev/null 2>&1; then
+  retry 5 10 python3 -m pip install --upgrade pip
+  retry 5 10 python3 -m pip install "ansible>=9,<10"
+fi
+command -v ansible >/dev/null || die "ansible not installed"
+if ! ansible-galaxy collection list 2>/dev/null | grep -q 'community.general'; then
+  retry 5 8 ansible-galaxy collection install community.general
+fi
+
+# Generate ansible keypair if missing
+if id -u ansible >/dev/null 2>&1; then
+  install -d -m 700 -o ansible -g ansible /home/ansible/.ssh
+  [ -f /home/ansible/.ssh/id_ed25519 ] || sudo -u ansible ssh-keygen -q -t ed25519 -N "" -f /home/ansible/.ssh/id_ed25519
+fi
+
+# SSH host keys + unmask
+ssh-keygen -A
+systemctl unmask ssh || true; systemctl unmask sshd || true
+
+# ---------------- SSH hardening (drop-in + FINAL include) ----------------
+SSHD="/etc/ssh/sshd_config"
+cp -a "$SSHD" "${SSHD}.bak.$(date +%s)"
+# Ensure Include directive for regular drop-ins
+grep -q '^Include ' "$SSHD" || sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$SSHD"
+mkdir -p /etc/ssh/sshd_config.d
+# Baseline drop-in (earlier in order)
+cat >/etc/ssh/sshd_config.d/60-mco-hardening.conf <<'EOF'
+# Baseline: groups + tunnels; (final auth enforced by zz-mco-final.conf)
+UsePAM yes
+AllowTcpForwarding yes
+PermitOpen 127.0.0.1:3128
+PermitOpen *:22
+AllowGroups mco-readonly mco-support mco-admin bastion-admins
+EOF
+
+# FINAL include appended at end of main config so our Match all is parsed LAST.
+FINAL_D=/etc/ssh/sshd_config.d
+FINAL_F=${FINAL_D}/zz-mco-final.conf
+mkdir -p "$FINAL_D"
+if ! tail -n 5 "$SSHD" | grep -q "$FINAL_F"; then
+  {
+    echo ""
+    echo "# MCO final overrides (must be last)"
+    echo "Include $FINAL_F"
+  } >> "$SSHD"
+fi
+# Final enforced auth rules
+if [ "${ENABLE_MFA}" = "yes" ]; then
+  retry 5 8 apt-get install -y libpam-google-authenticator
+  PAMSSHD="/etc/pam.d/sshd"; cp -a "$PAMSSHD" "${PAMSSHD}.bak.$(date +%s)"
+  grep -q "pam_google_authenticator.so" "$PAMSSHD" || sed -i '1i auth required pam_google_authenticator.so nullok' "$PAMSSHD"
+  cat > "$FINAL_F" <<'EOF'
+Match all
+  PermitRootLogin no
+  PasswordAuthentication no
+  PubkeyAuthentication yes
+  KbdInteractiveAuthentication yes
+  ChallengeResponseAuthentication yes
+  AuthenticationMethods publickey,keyboard-interactive
+EOF
+else
+  # No MFA -> disable all password paths
+  cat > "$FINAL_F" <<'EOF'
+Match all
+  PermitRootLogin no
+  PasswordAuthentication no
+  PubkeyAuthentication yes
+  KbdInteractiveAuthentication no
+  ChallengeResponseAuthentication no
+  AuthenticationMethods publickey
+EOF
+fi
+
+# Sanity test + restart
+sshd -t || die "sshd config test failed"
+systemctl restart ssh || systemctl restart sshd
+
+# ---------------- Users & sudo ----------------
+groupadd -f mco-readonly; groupadd -f mco-support; groupadd -f mco-admin; groupadd -f bastion-admins
+id -u "$ADMIN_USER" &>/dev/null || useradd -m -s /bin/bash "$ADMIN_USER"
+install -d -m 700 -o "$ADMIN_USER" -g "$ADMIN_USER" "/home/${ADMIN_USER}/.ssh"
+printf "%s\n" "$ADMIN_PUBKEY" > "/home/${ADMIN_USER}/.ssh/authorized_keys"
+chown "$ADMIN_USER:$ADMIN_USER" "/home/${ADMIN_USER}/.ssh/authorized_keys"; chmod 600 "/home/${ADMIN_USER}/.ssh/authorized_keys"
+chmod 755 "/home/${ADMIN_USER}"
+usermod -aG sudo,bastion-admins,mco-admin "$ADMIN_USER"
+echo "${ADMIN_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/10-admin-nopasswd; chmod 440 /etc/sudoers.d/10-admin-nopasswd
+
+if [ "${CREATE_ANSIBLE_USER}" = "yes" ]; then
+  id -u ansible &>/dev/null || useradd -m -s /bin/bash ansible
+  install -d -m 700 -o ansible -g ansible /home/ansible/.ssh
+  if [ -n "${ANSIBLE_USER_PUBKEY}" ]; then
+    printf "%s\n" "$ANSIBLE_USER_PUBKEY" > /home/ansible/.ssh/authorized_keys
+    chown ansible:ansible /home/ansible/.ssh/authorized_keys; chmod 600 /home/ansible/.ssh/authorized_keys
+  fi
+  usermod -aG sudo,mco-admin ansible
+  echo 'ansible ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-ansible; chmod 440 /etc/sudoers.d/90-ansible
+fi
+
+# ---------------- Firewall & base security ----------------
+ufw --force reset
+IFS=',' read -ra CIDRS <<< "$ALLOW_SSH_CIDRS"; for c in "${CIDRS[@]}"; do ufw allow from "$c" to any port 22 proto tcp || true; done
+ufw default deny incoming; ufw default allow outgoing; ufw --force enable
+
+cat >/etc/fail2ban/jail.d/sshd.local <<'EOF'
+[sshd]
+enabled = true
+mode = aggressive
+port   = ssh
+filter = sshd
+maxretry = 4
+findtime = 10m
+bantime = 1h
+EOF
+systemctl enable --now fail2ban
+dpkg-reconfigure -fnoninteractive unattended-upgrades || true
+cat >/etc/apt/apt.conf.d/51auto-reboot <<'EOF'
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-Time "03:30";
+EOF
+systemctl enable --now auditd || true
+
+# Minimal, safe sysctl
+cat >/etc/sysctl.d/99-mco.conf <<'EOF'
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.tcp_syncookies=1
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+kernel.kptr_restrict=2
+kernel.dmesg_restrict=1
+EOF
+sysctl --system || true
+
+# AIDE init and Lynis timer
+aideinit || true
+[ -f /var/lib/aide/aide.db.new ] && mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+cat >/etc/systemd/system/lynis.timer <<'EOF'
+[Unit] Description=Lynis periodic audit
+[Timer] OnBootSec=5m OnUnitActiveSec=1w Persistent=true
+[Install] WantedBy=timers.target
+EOF
+cat >/etc/systemd/system/lynis.service <<'EOF'
+[Unit] Description=Lynis audit
+[Service] Type=oneshot ExecStart=/usr/sbin/lynis audit system
+EOF
+systemctl daemon-reload
+systemctl enable --now lynis.timer
+
+# Logrotate for Ansible log
+cat >/etc/logrotate.d/ansible-mco <<'EOF'
+/opt/mco/ansible/ansible.log {
+  weekly
+  rotate 8
+  compress
+  missingok
+  notifempty
+  create 0640 root root
+}
+EOF
+
+# ---------------- Squid loopback proxy ----------------
+SQ="/etc/squid/squid.conf"
+cp -a "$SQ" "${SQ}.bak.$(date +%s)" || true
+cat >"$SQ" <<'EOF'
+http_port 127.0.0.1:3128
+acl localhost src 127.0.0.1/32
+acl SSL_ports port 443
+acl CONNECT method CONNECT
+http_access allow localhost
+http_access deny all
+via off
+forwarded_for delete
+request_header_access All deny all
+reply_header_access All deny all
+cache deny all
+EOF
+systemctl enable --now squid
+wait_port 127.0.0.1 3128 60 || { journalctl -u squid --no-pager | tail -n 100 >> "$LOG_FILE"; die "Squid not listening on 127.0.0.1:3128"; }
+
+# ---------------- Exporters (loopback) ----------------
+sed -i 's/^ARGS=.*/ARGS="--web.listen-address=127.0.0.1:9100 --collector.textfile.directory=\/var\/lib\/node_exporter\/textfile_collector"/' /etc/default/prometheus-node-exporter \
+  || echo 'ARGS="--web.listen-address=127.0.0.1:9100 --collector.textfile.directory=/var/lib/node_exporter/textfile_collector"' >/etc/default/prometheus-node-exporter
+install -d -m 755 /var/lib/node_exporter/textfile_collector
+systemctl enable --now prometheus-node-exporter
+wait_port 127.0.0.1 9100 30 || die "node_exporter not listening on 127.0.0.1:9100"
+
+if [ "${ENABLE_BLACKBOX}" = "yes" ]; then
+  mkdir -p /etc/prometheus
+  cat >/etc/prometheus/blackbox.yml <<'EOF'
+modules:
+  http_2xx:
+    prober: http
+    http:
+      preferred_ip_protocol: ip4
+      valid_status_codes: [200, 301, 302, 308]
+  tcp_ssh:
+    prober: tcp
+    tcp:
+      preferred_ip_protocol: ip4
+EOF
+  sed -i 's/^ARGS=.*/ARGS="--web.listen-address=127.0.0.1:9115 --config.file=\/etc\/prometheus\/blackbox.yml"/' /etc/default/prometheus-blackbox-exporter \
+    || echo 'ARGS="--web.listen-address=127.0.0.1:9115 --config.file=/etc/prometheus/blackbox.yml"' >/etc/default/prometheus-blackbox-exporter
+  mkdir -p /etc/systemd/system/prometheus-blackbox-exporter.service.d
+  cat >/etc/systemd/system/prometheus-blackbox-exporter.service.d/override.conf <<'EOF'
+[Service]
+Environment=HTTPS_PROXY=http://127.0.0.1:3128
+Environment=NO_PROXY=127.0.0.1,localhost
+EOF
+  systemctl daemon-reload
+  systemctl enable --now prometheus-blackbox-exporter
+  wait_port 127.0.0.1 9115 30 || die "blackbox_exporter not listening on 127.0.0.1:9115"
+fi
+
+# ---------------- Optional local VictoriaMetrics ----------------
+if [ "${INSTALL_LOCAL_VM}" = "yes" ]; then
+  [ -n "$VM_URL" ] || die "install_local_vm=yes but victoria_download_url is empty"
+  tmpd=$(mktemp -d); cd "$tmpd"
+  retry 5 8 curl -fsSL "$VM_URL" -o vm.tgz
+  tar -xzf vm.tgz
+  BIN="$(find . -type f -name 'victoria-metrics' | head -n1)"; [ -n "$BIN" ] || die "victoria-metrics binary not found"
+  install -m 0755 "$BIN" /usr/local/bin/victoria-metrics
+  cd /; rm -rf "$tmpd"
+  cat >/etc/systemd/system/victoria-metrics.service <<EOF
+[Unit]
+Description=VictoriaMetrics single-node
+After=network.target
+[Service]
+ExecStart=/usr/local/bin/victoria-metrics -retentionPeriod=${VM_RETENTION}d -httpListenAddr=127.0.0.1:8428 -selfScrapeInterval=0
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now victoria-metrics
+  wait_port 127.0.0.1 8428 60 || die "victoria-metrics not listening on 127.0.0.1:8428"
+  [ -z "$CENTRAL_METRICS_REMOTE_WRITE_URL" ] && CENTRAL_METRICS_REMOTE_WRITE_URL="http://127.0.0.1:8428/api/v1/write"
+fi
+
+# ---------------- Observability forwarder (Alloy or Prometheus local) ----------------
+if [ "${OBS_OPT}" = "alloy" ] && [ -n "${ALLOY_URL}" ]; then
+  mkdir -p /usr/local/bin; tmpd=$(mktemp -d); cd "$tmpd"
+  retry 5 8 curl -fsSL "$ALLOY_URL" -o alloy.tgz || retry 3 10 curl -fsSL "$ALLOY_URL" -o alloy
+  if file alloy 2>/dev/null | grep -qi "ELF"; then mv alloy /usr/local/bin/alloy && chmod +x /usr/local/bin/alloy; else
+    tar -xzf alloy.tgz || true
+    BIN="$(find . -type f -name 'alloy' | head -n1)"; [ -n "$BIN" ] || die "Alloy binary not found"
+    install -m 0755 "$BIN" /usr/local/bin/alloy
+  fi
+  cd /; rm -rf "$tmpd"
+  mkdir -p /etc/alloy
+  cat >/etc/alloy/config.alloy <<'EOF'
+logging { level = "info" }
+prometheus.scrape "node" { targets = [{ "__address__" = "127.0.0.1:9100" }]; forward_to = [prometheus.remote_write.central.receiver] }
+prometheus.scrape "blackbox" { targets = [{ "__address__" = "127.0.0.1:9115" }]; forward_to = [prometheus.remote_write.central.receiver] }
+prometheus.remote_write "central" { endpoint { url = "__RW_URL__" } }
+EOF
+  sed -i "s|__RW_URL__|$CENTRAL_METRICS_REMOTE_WRITE_URL|g" /etc/alloy/config.alloy
+  if [ -n "$CENTRAL_METRICS_REMOTE_WRITE_URL" ]; then
+    [ "$CENTRAL_METRICS_AUTH_TYPE" = "bearer" ] && [ -n "$CENTRAL_METRICS_BEARER_TOKEN" ] && { write_secret "/etc/mco/secrets/metrics_token" "$CENTRAL_METRICS_BEARER_TOKEN"; sed -i '/endpoint {/a \ \ \ \ bearer_token_file = "/etc/mco/secrets/metrics_token"' /etc/alloy/config.alloy; }
+    if [ "$CENTRAL_METRICS_AUTH_TYPE" = "basic" ]; then
+      write_secret "/etc/mco/secrets/metrics_user" "$CENTRAL_METRICS_BASIC_USER"
+      write_secret "/etc/mco/secrets/metrics_pass" "$CENTRAL_METRICS_BASIC_PASS"
+      sed -i '/endpoint {/a \ \ \ \ basic_auth { username = file("/etc/mco/secrets/metrics_user"); password = file("/etc/mco/secrets/metrics_pass") }' /etc/alloy/config.alloy
+    fi
+    if [ "$CENTRAL_METRICS_AUTH_TYPE" = "mtls" ] || [ -n "$METRICS_CA_CRT" ]; then
+      write_secret "/etc/mco/secrets/metrics_ca.crt" "$METRICS_CA_CRT"
+      write_secret "/etc/mco/secrets/metrics_client.crt" "$METRICS_CLIENT_CRT"
+      write_secret "/etc/mco/secrets/metrics_client.key" "$METRICS_CLIENT_KEY"
+      sed -i '/endpoint {/a \ \ \ \ tls_config { ca_file="/etc/mco/secrets/metrics_ca.crt" cert_file="/etc/mco/secrets/metrics_client.crt" key_file="/etc/mco/secrets/metrics_client.key" insecure_skip_verify=false min_version="TLS12" }' /etc/alloy/config.alloy
+    fi
+  fi
+  cat >/etc/systemd/system/alloy.service <<'EOF'
+[Unit] Description=Grafana Alloy After=network-online.target Wants=network-online.target
+[Service] ExecStart=/usr/local/bin/alloy run /etc/alloy/config.alloy
+User=root Restart=always RestartSec=5
+[Install] WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload; systemctl enable --now alloy
+else
+  retry 5 8 apt-get install -y prometheus
+  PROM_YML="/etc/prometheus/prometheus.yml"
+  cat >"$PROM_YML" <<EOF
+global:
+  scrape_interval: 15s
+  external_labels:
+$(for kv in $(echo "$GLOBAL_LABELS" | tr ',' ' '); do k="\${kv%%=*}"; v="\${kv#*=}"; [ -n "$k" ] && echo "    $k: \"$v\""; done)
+scrape_configs:
+  - job_name: node
+    static_configs: [ { targets: ["127.0.0.1:9100"] } ]
+$(if [ "$ENABLE_BLACKBOX" = "yes" ]; then cat <<'EOT'
+  - job_name: blackbox
+    metrics_path: /probe
+    params: { module: [http_2xx] }
+    static_configs: [ { targets: ["https://kubernetes.io/"] } ]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - target_label: instance
+        source_labels: [__param_target]
+      - target_label: __address__
+        replacement: 127.0.0.1:9115
+EOT
+fi)
+EOF
+  if [ -n "$CENTRAL_METRICS_REMOTE_WRITE_URL" ]; then
+    echo "remote_write:" >> "$PROM_YML"
+    echo "  - url: \"$CENTRAL_METRICS_REMOTE_WRITE_URL\"" >> "$PROM_YML"
+    case "$CENTRAL_METRICS_AUTH_TYPE" in
+      bearer)
+        write_secret "/etc/mco/secrets/metrics_token" "$CENTRAL_METRICS_BEARER_TOKEN"
+        echo "    bearer_token_file: /etc/mco/secrets/metrics_token" >> "$PROM_YML";;
+      basic)
+        write_secret "/etc/mco/secrets/metrics_user" "$CENTRAL_METRICS_BASIC_USER"
+        write_secret "/etc/mco/secrets/metrics_pass" "$CENTRAL_METRICS_BASIC_PASS"
+        echo "    basic_auth:" >> "$PROM_YML"
+        echo "      username: \"$(cat /etc/mco/secrets/metrics_user 2>/dev/null)\"" >> "$PROM_YML"
+        echo "      password_file: /etc/mco/secrets/metrics_pass" >> "$PROM_YML";;
+      mtls)
+        write_secret "/etc/mco/secrets/metrics_ca.crt" "$METRICS_CA_CRT"
+        write_secret "/etc/mco/secrets/metrics_client.crt" "$METRICS_CLIENT_CRT"
+        write_secret "/etc/mco/secrets/metrics_client.key" "$METRICS_CLIENT_KEY"
+        cat >>"$PROM_YML" <<'EOT'
+    tls_config:
+      ca_file: /etc/mco/secrets/metrics_ca.crt
+      cert_file: /etc/mco/secrets/metrics_client.crt
+      key_file: /etc/mco/secrets/metrics_client.key
+      insecure_skip_verify: false
+      min_version: TLS12
+EOT
+      ;;
+      none|*) : ;;
+    esac
+  fi
+  systemctl enable --now prometheus || die "Prometheus failed to start"
+fi
+
+# ---------------- Promtail (optional) ----------------
+if [ -n "$CENTRAL_LOGS_LOKI_URL" ] && [ -n "$PROMTAIL_URL" ]; then
+  tmpd=$(mktemp -d); cd "$tmpd"
+  retry 5 8 curl -fsSL "$PROMTAIL_URL" -o promtail.tgz
+  tar -xzf promtail.tgz
+  BIN="$(find . -type f -name 'promtail' | head -n1)"; [ -n "$BIN" ] || die "promtail binary not found"
+  install -m 0755 "$BIN" /usr/local/bin/promtail
+  cd /; rm -rf "$tmpd"
+  cat >/etc/promtail.yaml <<EOF
+server: { http_listen_port: 0 }
+clients:
+  - url: "$CENTRAL_LOGS_LOKI_URL"
+$( if [ "$CENTRAL_LOGS_AUTH_TYPE" = "bearer" ] && [ -n "$LOKI_BEARER_TOKEN" ]; then
+    write_secret "/etc/mco/secrets/loki_token" "$LOKI_BEARER_TOKEN"
+    echo '    bearer_token_file: /etc/mco/secrets/loki_token'
+   elif [ "$CENTRAL_LOGS_AUTH_TYPE" = "basic" ]; then
+    write_secret "/etc/mco/secrets/loki_user" "$LOKI_BASIC_USER"
+    write_secret "/etc/mco/secrets/loki_pass" "$LOKI_BASIC_PASS"
+    echo '    basic_auth:'; echo '      username: "'"$(cat /etc/mco/secrets/loki_user 2>/dev/null)"'"'; echo '      password_file: /etc/mco/secrets/loki_pass'
+   elif [ "$CENTRAL_LOGS_AUTH_TYPE" = "mtls" ]; then
+    write_secret "/etc/mco/secrets/loki_ca.crt" "$LOKI_CA_CRT"
+    write_secret "/etc/mco/secrets/loki_client.crt" "$LOKI_CLIENT_CRT"
+    write_secret "/etc/mco/secrets/loki_client.key" "$LOKI_CLIENT_KEY"
+   fi )
+positions: { filename: /var/lib/promtail/positions.yaml }
+scrape_configs:
+  - job_name: system
+    journal: { path: /var/log/journal, max_age: 12h }
+EOF
+  install -d -m 755 /var/lib/promtail
+  cat >/etc/systemd/system/promtail.service <<'EOF'
+[Unit] Description=Promtail After=network-online.target Wants=network-online.target
+[Service] ExecStart=/usr/local/bin/promtail -config.file /etc/promtail.yaml
+User=root Restart=always RestartSec=5
+[Install] WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload; systemctl enable --now promtail
+fi
+
+# ---------------- Doctor + Support bundle ----------------
+cat >/usr/local/bin/mco-doctor <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+OUT="/var/lib/node_exporter/textfile_collector/mco_doctor.prom"
+: > "$OUT"
+emit(){ echo "$1" >> "$OUT"; }
+emit "# HELP mco_doctor_check Result of bastion self-checks (1=ok,0=fail)"
+emit "# TYPE mco_doctor_check gauge"
+ok=1
+check(){ local n="$1"; shift; if "$@"; then emit "mco_doctor_check{check=\"$n\"} 1"; else emit "mco_doctor_check{check=\"$n\"} 0"; ok=0; fi; }
+check "ssh_active" bash -c 'systemctl is-active --quiet ssh || systemctl is-active --quiet sshd'
+check "fail2ban_active" systemctl is-active --quiet fail2ban
+check "squid_listening" bash -c 'nc -z -w1 127.0.0.1 3128'
+check "node_exporter_listening" bash -c 'nc -z -w1 127.0.0.1 9100'
+echo "# EOF" >> "$OUT"
+exit $((1-ok))
+EOF
+chmod +x /usr/local/bin/mco-doctor
+
+cat >/etc/systemd/system/mco-doctor.service <<'EOF'
+[Unit] Description=MCO Doctor (self-check exporter) After=network-online.target
+[Service] Type=oneshot ExecStart=/usr/local/bin/mco-doctor
+EOF
+cat >/etc/systemd/system/mco-doctor.timer <<'EOF'
+[Unit] Description=Run MCO Doctor hourly
+[Timer] OnBootSec=2m OnUnitActiveSec=1h Persistent=true
+[Install] WantedBy=timers.target
+EOF
+systemctl daemon-reload; systemctl enable --now mco-doctor.timer
+
+cat >/usr/local/bin/mco-support-bundle <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+TS=$(date +%Y%m%d-%H%M%S)
+OUT="/root/mco-support-bundle-${TS}.tar.gz"
+tar -czf "$OUT" \
+  /etc/ssh/sshd_config /etc/ssh/sshd_config.d /etc/sudoers.d /etc/ufw /etc/fail2ban \
+  /etc/squid /etc/prometheus /etc/alloy /etc/promtail.yaml /etc/mco /opt/mco 2>/dev/null || true
+journalctl -u ssh -u sshd -u fail2ban -u squid -u prometheus -u alloy -u promtail --since "24 hours ago" --no-pager > /root/mco-journal-last24h.txt || true
+tar -rzf "$OUT" /root/mco-journal-last24h.txt 2>/dev/null || true
+echo "$OUT"
+EOF
+chmod +x /usr/local/bin/mco-support-bundle
+
+# ---------------- SSH CA Toolkit (optional) ----------------
+if [ "${SSH_CA_MODE}" = "yes" ]; then
+  install -d -m 700 /etc/ssh/ca /etc/ssh/auth_principals
+  install -d -m 755 /etc/mco/features
+  cat >"${MCO_DIR}/bin/mco-ca-init.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+install -d -m 700 /etc/ssh/ca /etc/ssh/auth_principals
+[ -s /etc/ssh/ca/user_ca ] || ssh-keygen -t ed25519 -f /etc/ssh/ca/user_ca -C "MCO User CA" -N ''
+[ -s /etc/ssh/ca/host_ca ] || ssh-keygen -t ed25519 -f /etc/ssh/ca/host_ca -C "MCO Host CA" -N ''
+chmod 600 /etc/ssh/ca/*
+echo "User CA pub:"; cat /etc/ssh/ca/user_ca.pub
+echo "Host CA pub:"; cat /etc/ssh/ca/host_ca.pub
+EOF
+  chmod +x "${MCO_DIR}/bin/mco-ca-init.sh"
+# Initialize CA keys right away (idempotent)
+  "${MCO_DIR}/bin/mco-ca-init.sh" || true
+
+  cat >"${MCO_DIR}/bin/mco-cert-user.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Usage: mco-cert-user.sh <principal> <pubkey_path> <ttl> [source_ip_cidr]
+P="${1:-}"; K="${2:-}"; TTL="${3:-8h}"; SRC="${4:-}"
+[ -z "$P" ] || [ -z "$K" ] && { echo "Usage: $0 <principal> <pubkey_path> <ttl> [source_ip_cidr]"; exit 1; }
+OPTS=(); [ -n "$SRC" ] && OPTS+=(-O "source-address=${SRC}")
+ssh-keygen -s /etc/ssh/ca/user_ca -I "${P}-$(date +%F-%H%M%S)" -n "$P" -V "+${TTL}" -z $(( $(date +%s) )) "${OPTS[@]}" "$K"
+echo "Issued cert next to $K"
+EOF
+  chmod +x "${MCO_DIR}/bin/mco-cert-user.sh"
+
+  cat >"${MCO_DIR}/bin/mco-cert-ansible.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+TTL="${1:-2h}"
+BIP="$(cat /opt/mco/BASTION_PUBLIC_IP 2>/dev/null || echo)"
+[ -z "$BIP" ] && { echo "Bastion IP unknown; set /opt/mco/BASTION_PUBLIC_IP"; exit 1; }
+ssh-keygen -s /etc/ssh/ca/user_ca -I "ansible-$(date +%F-%H%M%S)" -n ansible -V "+${TTL}" -z $(( $(date +%s) )) -O "source-address=${BIP}/32" /home/ansible/.ssh/id_ed25519.pub
+chown ansible:ansible /home/ansible/.ssh/id_ed25519*-cert.pub
+echo "Ansible cert issued for ${TTL}"
+EOF
+  chmod +x "${MCO_DIR}/bin/mco-cert-ansible.sh"
+
+  cat >"${MCO_DIR}/bin/mco-krl-revoke.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Usage: mco-krl-revoke.sh <pubkey_to_revoke.pub>
+PUB="${1:-}"; [ -z "$PUB" ] && { echo "Usage: $0 <pubkey_to_revoke.pub>"; exit 1; }
+KRL="/etc/ssh/ca/revoked_keys.krl"
+if [ -s "$KRL" ]; then ssh-keygen -k -f "$KRL" -z $(( $(date +%s) )) "$PUB"; else ssh-keygen -k -f "$KRL" -z 1 "$PUB"; fi
+echo "Updated KRL at $KRL"
+EOF
+  chmod +x "${MCO_DIR}/bin/mco-krl-revoke.sh"
+
+  # CA playbooks
+  cat >"${MCO_DIR}/ansible/ssh_ca_distribute.yml" <<'EOF'
+---
+- name: Configure SSH to trust MCO User CA
+  hosts: customer_vms
+  become: true
+  vars: { user_ca_pub: "{{ lookup('file', '/etc/ssh/ca/user_ca.pub') }}" }
+  tasks:
+    - file: { path: /etc/ssh/auth_principals, state: directory, mode: '0755' }
+    - copy: { content: "{{ user_ca_pub }}\n", dest: /etc/ssh/ca_user.pub, mode: '0644' }
+    - lineinfile: { path: /etc/ssh/sshd_config, regexp: '^#?TrustedUserCAKeys', line: 'TrustedUserCAKeys /etc/ssh/ca_user.pub', state: present }
+    - lineinfile: { path: /etc/ssh/sshd_config, regexp: '^#?AuthorizedPrincipalsFile', line: 'AuthorizedPrincipalsFile /etc/ssh/auth_principals/%u', state: present }
+    - copy: { content: "mco_ro\n", dest: /etc/ssh/auth_principals/mco_ro, mode: '0644' }
+    - copy: { content: "ansible\n", dest: /etc/ssh/auth_principals/ansible, mode: '0644' }
+    - lineinfile: { path: /etc/ssh/sshd_config, regexp: '^#?RevokedKeys', line: 'RevokedKeys /etc/ssh/revoked_keys.krl', state: present }
+    - file: { path: /etc/ssh/revoked_keys.krl, state: touch, mode: '0644' }
+    - service: { name: ssh, state: restarted }
+      failed_when: false
+    - service: { name: sshd, state: restarted }
+      failed_when: false
+EOF
+
+  cat >"${MCO_DIR}/ansible/ssh_sign_hostkeys.yml" <<'EOF'
+---
+- name: Sign host keys with MCO Host CA
+  hosts: customer_vms
+  become: true
+  tasks:
+    - stat: { path: /etc/ssh/ssh_host_ed25519_key.pub }
+      register: hk
+    - fetch: { src: /etc/ssh/ssh_host_ed25519_key.pub, dest: /tmp/hostkeys/{{ inventory_hostname }}.pub, flat: yes }
+      when: hk.stat.exists
+- name: Sign on bastion and copy back
+  hosts: localhost
+  gather_facts: false
+  vars: { host_ca: /etc/ssh/ca/host_ca, host_cert_ttl_days: 60 }
+  tasks:
+    - stat: { path: "{{ host_ca }}" }
+      register: ca
+    - fail: { msg: "Host CA not found at {{ host_ca }}" }
+      when: not ca.stat.exists
+    - shell: |
+        set -euo pipefail
+        for f in /tmp/hostkeys/*.pub; do
+          [ -f "$f" ] || continue
+          base="$(basename "$f" .pub)"
+          ssh-keygen -s "{{ host_ca }}" -I "vm-${base}-$(date +%F)" -h -V +{{ host_cert_ttl_days }}d "$f"
+        done
+      args: { executable: /bin/bash }
+    - delegate_to: "{{ item }}"
+      copy: { src: "/tmp/hostkeys/{{ item }}-cert.pub", dest: "/etc/ssh/ssh_host_ed25519_key-cert.pub", mode: '0644' }
+      loop: "{{ groups['customer_vms'] | default([]) }}"
+    - delegate_to: "{{ item }}"
+      service: { name: ssh, state: restarted }
+      failed_when: false
+      loop: "{{ groups['customer_vms'] | default([]) }}"
+
+      
+EOF
+  # Stamp feature flag outside of here-doc
+  echo enabled > /etc/mco/features/ssh_ca_mode
+fi
+
+# ---------------- Egress enforcement (optional) ----------------
+if [ "$EGRESS_ENFORCED" = "yes" ]; then
+  ufw default deny outgoing
+  ufw allow out 53
+  ufw allow out 123/udp
+  ufw allow out 80/tcp
+  ufw allow out 443/tcp
+  ufw --force reload
+fi
+
+# ---------------- MOTD ----------------
+cat >"${MCO_DIR}/POST_INSTALL_INSTRUCTIONS.txt" <<EOF
+Keys:
+  /opt/mco/keys/mco-readonly/*.pub
+  /opt/mco/keys/mco-support/<user>.pub
+Sync & apply:
+  sudo /opt/mco/bin/mco-ro-keys-sync
+  sudo /opt/mco/bin/mco-add-support-user <user>
+  cd /opt/mco/ansible && ansible-galaxy collection install -r requirements.yml
+  ansible-playbook -i inventory.ini playbooks_minimal.yml
+Restrict VM SSH to bastion:
+  ansible-playbook -i inventory.ini ufw_ssh_from_bastion.yml
+(SSH CA optional)
+  sudo /opt/mco/bin/mco-ca-init.sh
+  ansible-playbook -i inventory.ini ssh_ca_distribute.yml
+  /opt/mco/bin/mco-cert-user.sh mco_ro /home/engineer/.ssh/id_ed25519.pub ${USER_CERT_TTL}h ${PUB_IP}/32
+  /opt/mco/bin/mco-cert-ansible.sh ${ANSIBLE_CERT_TTL}h
+Kube API tunneling:
+  /opt/mco/bin/mco-kube-make-tunnel.sh cluster1 <apiserver-host> 16443 ${ADMIN_USER}
+  Then on engineer workstation: ssh -N -L 16443:<apiserver-host>:443 ${ADMIN_USER}@${PUB_IP}
+EOF
+echo -e "MCO Bastion ready.\nGuide: /opt/mco/README.md\nPublic IP: ${PUB_IP}\n" > /etc/motd
+
+# ---------------- Final validation (fail-fast, context-aware) ----------------
+CTX="$(sshd -T -C user=${ADMIN_USER},host=$(hostname),addr=127.0.0.1 || true)"
+echo "$CTX" | grep -q '^permitrootlogin no$' || die "sshd: PermitRootLogin not 'no' (effective)"
+if [ "${ENABLE_MFA}" = "yes" ]; then
+  echo "$CTX" | grep -q '^passwordauthentication no$' || die "sshd: PasswordAuthentication not 'no' (effective)"
+  echo "$CTX" | grep -q '^pubkeyauthentication yes$' || die "sshd: PubkeyAuthentication not 'yes' (effective)"
+else
+  echo "$CTX" | grep -q '^passwordauthentication no$' || die "sshd: PasswordAuthentication not 'no' (effective)"
+  echo "$CTX" | grep -q '^kbdinteractiveauthentication no$' || die "sshd: KbdInteractiveAuthentication not 'no' (effective)"
+  echo "$CTX" | grep -q '^pubkeyauthentication yes$' || die "sshd: PubkeyAuthentication not 'yes' (effective)"
+  echo "$CTX" | grep -q '^authenticationmethods publickey$' || die "sshd: AuthenticationMethods not 'publickey' (effective)"
+fi
+grep -q '^PermitOpen 127.0.0.1:3128' /etc/ssh/sshd_config.d/60-mco-hardening.conf || die "PermitOpen 127.0.0.1:3128 missing"
+grep -q '^PermitOpen \*:22' /etc/ssh/sshd_config.d/60-mco-hardening.conf || die "PermitOpen *:22 missing"
+(systemctl is-active --quiet ssh || systemctl is-active --quiet sshd) || die "ssh service not active"
+systemctl is-active --quiet fail2ban || die "fail2ban not active"
+ufw status | grep -q "Status: active" || die "UFW not active"
+systemctl is-active --quiet squid || die "squid not active"
+wait_port 127.0.0.1 3128 5 || die "3128 not listening"
+nc -z -w1 127.0.0.1 9100 || die "node_exporter not listening"
+[ "${ENABLE_BLACKBOX}" = "yes" ] && nc -z -w1 127.0.0.1 9115 || true
+command -v ansible >/dev/null || die "ansible not installed"
+ansible-galaxy collection list | grep -q 'community.general' || die "Ansible collection community.general missing"
+test -f /opt/mco/ansible/inventory.ini || die "missing inventory.ini"
+test -f /opt/mco/ansible/group_vars/all.yml || die "missing group_vars/all.yml"
+test -f /opt/mco/ansible/playbooks_minimal.yml || die "missing playbooks_minimal.yml"
+test -f /opt/mco/ansible/ansible.cfg || die "missing ansible.cfg"
+test -f /opt/mco/ansible/requirements.yml || die "missing requirements.yml"
+test -x /opt/mco/bin/mco-ro-keys-sync || die "missing mco-ro-keys-sync"
+test -x /opt/mco/bin/mco-add-ro-key || die "missing mco-add-ro-key"
+test -x /opt/mco/bin/mco-add-support-user || die "missing mco-add-support-user"
+test -x /opt/mco/bin/add_known_host.sh || die "missing add_known_host.sh"
+test -x /opt/mco/bin/mco-kube-make-tunnel.sh || die "missing mco-kube-make-tunnel.sh"
+test -f /opt/mco/README.md || die "missing README.md"
+
+echo "[DONE] Bastion provisioned successfully (v11, full)."
